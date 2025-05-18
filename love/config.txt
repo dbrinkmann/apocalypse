@@ -1,0 +1,4 @@
+conn1_character=Hex
+conn1_password=lumber
+conn2_character=Doc
+conn2_password=lumber
