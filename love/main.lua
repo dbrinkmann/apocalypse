@@ -4,12 +4,24 @@ local GameWorld = require("game_world")
 local Parser = require("parser")
 local Logger = require("logger")
 
+-- Login states
+local LOGIN_STATE = {
+    INITIAL = 0,
+    SENT_NAME = 1,
+    SENT_PASSWORD = 2,
+    SENT_EMPTY = 3,
+    WAITING_RECONNECT = 4,
+    SENT_RECONNECT = 5,
+    WAITING_WELCOME = 6,
+    SENT_MENU_CHOICE = 7,
+    COMPLETE = 8
+}
+
 -- Game window config
 local gameWin = {
     width = 1200,
     height = 800,
     title = "Apocalypse",
-    background = nil,
     camera = {
         x = 0,
         y = 0,
@@ -24,11 +36,13 @@ local windowZOrder = {}
 
 -- Each connection represents one MUD session
 local connections = {}
-local inputBuffer = ""
-local messages = {}
+local inputBuffers = {}  -- Changed to table to store input buffer per connection
+local messages = {}  -- Changed to table to store messages per connection
+local loginStates = {}  -- Track login state for each connection
+local loginConfig = {}  -- Store login credentials from config
 local font, fontHeight
 local roomNameFont = nil  -- New font for room name
-local scrollOffset = 0
+local scrollOffsets = {}  -- Changed to table to store scroll offset per connection
 local maxLines = 30
 local cursorTimer = 0
 local cursorVisible = true
@@ -72,7 +86,8 @@ local UIWindow = {
     minHeight = 200,
     title = "",
     visible = true,
-    zIndex = 0
+    zIndex = 0,
+    id = nil  -- Added id field
 }
 
 function UIWindow:new(o)
@@ -127,30 +142,20 @@ function UIWindow:draw()
     love.graphics.setColor(1,1,1,1)
 end
 
--- Create terminal window
-local termWin = UIWindow:new({
-    title = "Terminal",
-    x = 50,
-    y = 50
-})
-table.insert(uiWindows, termWin)
-
--- Game world state
-local gameWorld = {
-    background = nil,
-    entities = {},
-    items = {}
-}
-
 -- Center window on screen
 local function centerWindow()
     local winW, winH = love.graphics.getWidth(), love.graphics.getHeight()
-    termWin.x = (winW - termWin.width) / 2
-    termWin.y = (winH - termWin.height) / 2
+    for _, window in ipairs(uiWindows) do
+        window.x = (winW - window.width) / 2
+        window.y = (winH - window.height) / 2
+    end
 end
 
 local function getWindowPos()
-    return termWin.x, termWin.y
+    if #uiWindows > 0 then
+        return uiWindows[1].x, uiWindows[1].y
+    end
+    return 0, 0
 end
 
 -- Parse ANSI color codes and return a table of {text, color} segments
@@ -262,8 +267,73 @@ local function sanitize_utf8(str)
     return result
 end
 
+-- Function to load login config
+local function loadLoginConfig()
+    local file = io.open("config.txt", "r")
+    if not file then
+        Logger.debug("Failed to open config.txt")
+        return
+    end
+    
+    for line in file:lines() do
+        local key, value = line:match("([^=]+)=(.+)")
+        if key and value then
+            loginConfig[key] = value
+        end
+    end
+    file:close()
+end
+
+-- Initialize connection-specific data
+local function initConnectionData(connId)
+    inputBuffers[connId] = ""
+    messages[connId] = {}
+    scrollOffsets[connId] = 0
+    loginStates[connId] = LOGIN_STATE.INITIAL
+end
+
+-- Function to handle login process
+local function handleLogin(conn, msg)
+    if loginStates[conn.id] == LOGIN_STATE.INITIAL then
+        -- Send character name
+        table.insert(conn.outgoing, loginConfig["conn" .. conn.id .. "_character"])
+        loginStates[conn.id] = LOGIN_STATE.SENT_NAME
+        --Logger.debug("[LOGIN]["..conn.id.."] SENDING NAME")
+    elseif loginStates[conn.id] == LOGIN_STATE.SENT_NAME then
+        -- Send password
+        table.insert(conn.outgoing, loginConfig["conn" .. conn.id .. "_password"])
+        loginStates[conn.id] = LOGIN_STATE.SENT_PASSWORD
+        --Logger.debug("[LOGIN]["..conn.id.."] SENDING PASSWORD")
+    elseif loginStates[conn.id] == LOGIN_STATE.SENT_PASSWORD then
+        -- Send empty line
+        table.insert(conn.outgoing, "")
+        loginStates[conn.id] = LOGIN_STATE.SENT_EMPTY
+        --Logger.debug("[LOGIN]["..conn.id.."] SENDING EMPTY LINE")
+    elseif loginStates[conn.id] == LOGIN_STATE.SENT_EMPTY then
+        if msg:match("Reconnecting.") or msg:match("You take over your own body, already in use!") then
+            loginStates[conn.id] = LOGIN_STATE.WAITING_RECONNECT
+        elseif msg:match("Welcome to Apocalypse VI!") then
+            table.insert(conn.outgoing, "")
+            loginStates[conn.id] = LOGIN_STATE.WAITING_WELCOME
+        end
+    elseif loginStates[conn.id] == LOGIN_STATE.WAITING_RECONNECT then
+        -- Send 'l' for reconnect
+        table.insert(conn.outgoing, "l")
+        loginStates[conn.id] = LOGIN_STATE.COMPLETE
+    elseif loginStates[conn.id] == LOGIN_STATE.WAITING_WELCOME then
+        -- Send menu choice '1'
+        --Logger.debug("[LOGIN]["..conn.id.."] SENDING MENU CHOICE 1")
+        table.insert(conn.outgoing, "1")
+        loginStates[conn.id] = LOGIN_STATE.SENT_MENU_CHOICE
+    elseif loginStates[conn.id] == LOGIN_STATE.SENT_MENU_CHOICE then
+        -- Login complete
+        --Logger.debug("[LOGIN]["..conn.id.."] LOGIN COMPLETE")
+        loginStates[conn.id] = LOGIN_STATE.COMPLETE
+    end
+end
+
 -- Create a coroutine for each connection
-local function createConnection(host, port)
+local function createConnection(host, port, connId)
     local conn = {
         host = host,
         port = port,
@@ -273,8 +343,13 @@ local function createConnection(host, port)
         outgoing = {},
         status = "connecting",
         lastAttempt = 0,
-        retryDelay = 5  -- seconds between retry attempts
+        retryDelay = 5,  -- seconds between retry attempts
+        id = connId
     }
+    
+    -- Initialize connection-specific data
+    initConnectionData(connId)
+    
     conn.tcp:settimeout(5)  -- 5 second timeout for connection attempts
     
     -- Try to connect and handle errors
@@ -306,12 +381,15 @@ local function createConnection(host, port)
             while true do
                 local line, err, partial = conn.tcp:receive("*l")
                 if line then
-                    Logger.debug("RECEIVED: " .. tostring(line))
+                    -- Handle login process
+                    if loginStates[conn.id] < LOGIN_STATE.COMPLETE then
+                        --Logger.debug("[LOGIN]["..conn.id.."] HANDLING LOGIN")
+                        handleLogin(conn, line)
+                    end
                     -- Sanitize the received line before storing it
                     local sanitized = sanitize_utf8(line)
                     table.insert(conn.incoming, sanitized)
                 elseif partial and partial ~= "" then
-                    Logger.debug("RECEIVED (partial): " .. tostring(partial))
                     -- Sanitize the partial line before storing it
                     local sanitized = sanitize_utf8(partial)
                     table.insert(conn.incoming, sanitized)
@@ -329,29 +407,13 @@ local function createConnection(host, port)
     return conn
 end
 
--- Function to load room background
-local function loadRoomBackground(roomName)
-    if not roomName then return end
-    
-    -- Clean the room name for filename use
-    local cleanName = roomName:gsub("[^%w%s]", ""):gsub("%s+", "_")
-    local imagePath = "images/rooms/" .. cleanName .. ".jpg"
-    
-    -- Try to load the room-specific image
-    local success, image = pcall(function() return love.graphics.newImage(imagePath) end)
-    if success and image then
-        gameWin.background = image
-    else
-        -- Fallback to default city image
-        local defaultPath = "images/rooms/City of Midgaard.jpg"
-        local success, image = pcall(function() return love.graphics.newImage(defaultPath) end)
-        if success and image then
-            gameWin.background = image
-        else
-            gameWin.background = nil
-        end
-    end
-end
+-- Game world state
+local gameWorld = {
+    background = nil,
+    entities = {},
+    items = {},
+    currentRoom = nil
+}
 
 function love.load()
     love.keyboard.setKeyRepeat(true)
@@ -375,11 +437,40 @@ function love.load()
     -- Initialize logger
     Logger.init()
     
-    -- Try to connect to the MUD server
-    local conn = createConnection("apocalypse6.com", 6000)
-    table.insert(connections, conn)
-    Logger.debug("Attempting to connect to apocalypse6.com:6000")
-    -- Center terminal window
+    -- Load login config
+    loadLoginConfig()
+    
+    -- Create terminal windows and connections based on config
+    local conn1 = createConnection("apocalypse6.com", 6000, 1)
+    table.insert(connections, conn1)
+    
+    -- Create terminal window for connection 1
+    local termWin1 = UIWindow:new({
+        title = "Terminal 1",
+        x = 50,
+        y = 50,
+        id = 1
+    })
+    table.insert(uiWindows, termWin1)
+    
+    -- Only create second terminal if config exists
+    if loginConfig["conn2_character"] and loginConfig["conn2_password"] then
+        local conn2 = createConnection("apocalypse6.com", 6000, 2)
+        table.insert(connections, conn2)
+        
+        local termWin2 = UIWindow:new({
+            title = "Terminal 2",
+            x = 500,
+            y = 50,
+            id = 2
+        })
+        table.insert(uiWindows, termWin2)
+    end
+    
+    -- Set initial active window
+    activeWindow = termWin1
+    
+    -- Center terminal windows
     centerWindow()
 end
 
@@ -452,10 +543,12 @@ function love.update(dt)
             -- Parse the message before adding it to the display
             if Parser:parse(msg) then
                 -- If we parsed a new room name, update the background
-                loadRoomBackground(Parser:getCurrentRoom())
+                GameWorld:loadRoomBackground(Parser:getCurrentRoom())
+                if Parser:getCurrentRoom() then
+                    gameWorld.currentRoom = { name = Parser:getCurrentRoom() }
+                end
             end
-            --Logger.debug("MESSAGES: " .. tostring(msg))
-            table.insert(messages, msg)
+            table.insert(messages[conn.id], msg)
             Logger.raw(msg)
         end
         conn.incoming = {}
@@ -469,15 +562,17 @@ function love.update(dt)
             break
         end
     end
-    if disconnected then
-        termWin.title = "Terminal [DISCONNECTED]"
-    else
-        termWin.title = "Terminal"
+    for _, window in ipairs(uiWindows) do
+        if disconnected then
+            window.title = "Terminal " .. window.id .. " [DISCONNECTED]"
+        else
+            window.title = "Terminal " .. window.id
+        end
     end
 end
 
 function love.textinput(t)
-    inputBuffer = inputBuffer .. t
+    inputBuffers[activeWindow.id] = inputBuffers[activeWindow.id] .. t
 end
 
 function love.keypressed(key)
@@ -485,34 +580,59 @@ function love.keypressed(key)
         showSplash = false
         return
     end
+    
     if key == "return" then
-        for _, conn in ipairs(connections) do
-            if conn.status == "connected" then
-                table.insert(conn.outgoing, inputBuffer)
-            else
-                table.insert(messages, "Cannot send message - " .. conn.status)
-                Logger.debug("Cannot send message - " .. conn.status)
+        if inputBuffers[activeWindow.id] ~= "" then
+            for _, conn in ipairs(connections) do
+                if conn.id == activeWindow.id and conn.status == "connected" then
+                    table.insert(conn.outgoing, inputBuffers[activeWindow.id])
+                else
+                    table.insert(messages[activeWindow.id], "Cannot send message - " .. conn.status)
+                    Logger.debug("Cannot send message - " .. conn.status)
+                end
+            end
+            local msg = "> " .. inputBuffers[activeWindow.id]
+            table.insert(messages[activeWindow.id], msg)
+            Logger.raw(msg)
+            inputBuffers[activeWindow.id] = ""
+            scrollOffsets[activeWindow.id] = 0 -- auto-scroll to bottom on input
+        else
+            -- Send empty line when enter is pressed with empty input
+            for _, conn in ipairs(connections) do
+                if conn.id == activeWindow.id and conn.status == "connected" then
+                    table.insert(conn.outgoing, "")
+                end
+            end
+            local msg = "> "
+            table.insert(messages[activeWindow.id], msg)
+            Logger.raw(msg)
+            scrollOffsets[activeWindow.id] = 0 -- auto-scroll to bottom on input
+        end
+    elseif key == "backspace" then
+        inputBuffers[activeWindow.id] = inputBuffers[activeWindow.id]:sub(1, -2)
+    elseif key == "up" then
+        scrollOffsets[activeWindow.id] = math.min(scrollOffsets[activeWindow.id] + 1, math.max(0, #messages[activeWindow.id] - maxLines))
+    elseif key == "down" then
+        scrollOffsets[activeWindow.id] = math.max(scrollOffsets[activeWindow.id] - 1, 0)
+    elseif key == "tab" then
+        -- Switch between windows
+        local currentIndex = 1
+        for i, window in ipairs(uiWindows) do
+            if window == activeWindow then
+                currentIndex = i
+                break
             end
         end
-        local msg = "> " .. inputBuffer
-        table.insert(messages, msg)
-        Logger.raw(msg)
-        inputBuffer = ""
-        scrollOffset = 0 -- auto-scroll to bottom on input
-    elseif key == "backspace" then
-        inputBuffer = inputBuffer:sub(1, -2)
-    elseif key == "up" then
-        scrollOffset = math.min(scrollOffset + 1, math.max(0, #messages - maxLines))
-    elseif key == "down" then
-        scrollOffset = math.max(scrollOffset - 1, 0)
+        local nextIndex = (currentIndex % #uiWindows) + 1
+        activeWindow = uiWindows[nextIndex]
     end
 end
 
 function love.wheelmoved(x, y)
     if y > 0 then
-        scrollOffset = math.min(scrollOffset + 1, math.max(0, #messages - maxLines))
+        scrollOffsets[activeWindow.id] = math.min(scrollOffsets[activeWindow.id] + 1, math.max(0, #messages[activeWindow.id] - maxLines))
     elseif y < 0 then
-        scrollOffset = math.max(scrollOffset - 1, 0)
+        scrollOffsets[activeWindow.id] = math.max(scrollOffsets[activeWindow.id] - 1, 0)
     end
 end
 
@@ -521,13 +641,11 @@ function love.mousepressed(x, y, button)
         showSplash = false
         return
     end
-    if button == 1 then
-        -- Check if clicking on any window resize handle or title bar
+    
+    if button == 1 then  -- Left mouse button
+        -- Check if any window was clicked
         for _, window in ipairs(uiWindows) do
-            if window:isResizeHandle(x, y) then
-                window.resizing = true
-                window.resizeOffsetX = x - (window.x + window.width)
-                window.resizeOffsetY = y - (window.y + window.height)
+            if window:isPointInside(x, y) then
                 -- Bring window to front
                 for i, w in ipairs(uiWindows) do
                     if w == window then
@@ -536,18 +654,15 @@ function love.mousepressed(x, y, button)
                         break
                     end
                 end
-                break
-            elseif window:isTitleBar(x, y) then
-                window.dragging = true
-                window.dragOffsetX = x - window.x
-                window.dragOffsetY = y - window.y
-                -- Bring window to front
-                for i, w in ipairs(uiWindows) do
-                    if w == window then
-                        table.remove(uiWindows, i)
-                        table.insert(uiWindows, window)
-                        break
-                    end
+                activeWindow = window
+                if window:isTitleBar(x, y) then
+                    window.dragging = true
+                    window.dragOffsetX = x - window.x
+                    window.dragOffsetY = y - window.y
+                elseif window:isResizeHandle(x, y) then
+                    window.resizing = true
+                    window.resizeOffsetX = x - window.width
+                    window.resizeOffsetY = y - window.height
                 end
                 break
             end
@@ -561,16 +676,14 @@ function love.mousemoved(x, y, dx, dy)
             window.x = x - window.dragOffsetX
             window.y = y - window.dragOffsetY
         elseif window.resizing then
-            local newWidth = x - window.x - window.resizeOffsetX
-            local newHeight = y - window.y - window.resizeOffsetY
-            window.width = math.max(window.minWidth, newWidth)
-            window.height = math.max(window.minHeight, newHeight)
+            window.width = math.max(window.minWidth, x - window.x + window.resizeOffsetX)
+            window.height = math.max(window.minHeight, y - window.y + window.resizeOffsetY)
         end
     end
 end
 
 function love.mousereleased(x, y, button)
-    if button == 1 then
+    if button == 1 then  -- Left mouse button
         for _, window in ipairs(uiWindows) do
             window.dragging = false
             window.resizing = false
@@ -598,107 +711,52 @@ local function safe_printf(str, x, y, limit, align)
 end
 
 function love.draw()
-    if showSplash and splashImage then
-        love.graphics.setColor(0,0,0,1)
-        love.graphics.rectangle("fill", 0, 0, love.graphics.getWidth(), love.graphics.getHeight())
-        local winW, winH = love.graphics.getWidth(), love.graphics.getHeight()
-        local imgW, imgH = splashImage:getWidth(), splashImage:getHeight()
-        local scale = math.min(winW/imgW, winH/imgH)
-        local drawW, drawH = imgW*scale, imgH*scale
-        love.graphics.setColor(1,1,1,1)
-        love.graphics.draw(splashImage, (winW-drawW)/2, (winH-drawH)/2, 0, scale, scale)
+    -- Draw splash screen if enabled
+    if showSplash then
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.draw(splashImage, 0, 0, 0, gameWin.width / splashImage:getWidth(), gameWin.height / splashImage:getHeight())
         return
     end
     
-    -- Draw background if available
-    if gameWin.background then
-        love.graphics.setColor(1, 1, 1, 1)
-        local winW, winH = love.graphics.getWidth(), love.graphics.getHeight()
-        local imgW, imgH = gameWin.background:getWidth(), gameWin.background:getHeight()
-        local scale = math.max(winW/imgW, winH/imgH)  -- Cover the entire window
-        local drawW, drawH = imgW*scale, imgH*scale
-        love.graphics.draw(gameWin.background, (winW-drawW)/2, (winH-drawH)/2, 0, scale, scale)
-    end
+    -- Draw game world (background, room name, items, entities)
+    local roomName = (gameWorld.currentRoom and gameWorld.currentRoom.name) or "Unknown Room"
+    GameWorld:draw(roomName, roomNameFont, font)
     
-    -- Draw game world
-    GameWorld:draw()
-    
-    -- Draw room name at the top of the main window
-    local currentRoom = Parser:getCurrentRoom()
-    if currentRoom then
-        -- Set up the fantasy font for room name
-        love.graphics.setFont(roomNameFont)
-        
-        -- Draw a semi-transparent background for better readability
-        local winW = love.graphics.getWidth()
-        local textWidth = roomNameFont:getWidth(currentRoom)
-        local textHeight = roomNameFont:getHeight()
-        local padding = 20
-        
-        -- Draw background rectangle
-        love.graphics.setColor(0, 0, 0, 0.7)
-        love.graphics.rectangle("fill", 
-            (winW - textWidth)/2 - padding, 
-            20 - padding/2, 
-            textWidth + padding*2, 
-            textHeight + padding, 
-            10, 10)
-        
-        -- Draw room name with a fantasy style
-        love.graphics.setColor(0.8, 0.8, 1, 1)  -- Slightly purple tint
-        safe_print(currentRoom, (winW - textWidth) / 2, 20)
-        
-        -- Reset font for rest of the UI
-        love.graphics.setFont(font)
-        --Logger.debug("DISPLAYING ROOM: " .. currentRoom)
-    end
-    
-    -- Draw UI windows
+    -- Draw all UI windows on top of the game world and room name
     for _, window in ipairs(uiWindows) do
         window:draw()
-    end
-    
-    -- Draw terminal content
-    local contentX = termWin.x + 16
-    local contentY = termWin.y + termWin.barHeight + 8
-    
-    -- Draw current room name if available
-    --local currentRoom = Parser:getCurrentRoom()
-    --if currentRoom then
-    --    love.graphics.setColor(0.3, 0.3, 1, 1)  -- Bright blue color
-    --    safe_print("Current Room: " .. currentRoom, contentX, contentY)
-    --    contentY = contentY + fontHeight + 8  -- Add some spacing after room name
-    --end
-    
-    -- Calculate available width for input
-    local availableWidth = termWin.width - 32
-    local inputText = inputBuffer .. (cursorVisible and "_" or " ")
-    local wrappedText, wrappedLines = font:getWrap(inputText, availableWidth)
-    local inputHeight = #wrappedLines * fontHeight
-    -- Position input at the bottom of the window
-    local inputY = termWin.y + termWin.height - inputHeight - 16
-    safe_printf(inputText, contentX, inputY, availableWidth, "left")
-    -- Calculate the area above the input for status and messages
-    local belowInputY = inputY
-    -- Draw messages with ANSI color parsing
-    local y = termWin.y + termWin.barHeight + 8
-    local maxLinesInWin = math.floor((belowInputY - y - 24) / fontHeight)
-    local startIdx = math.max(1, #messages - maxLinesInWin - scrollOffset + 1)
-    local endIdx = math.max(1, #messages - scrollOffset)
-    for i = startIdx, endIdx do
-        local msg = messages[i]
-        if msg then
-            local x = contentX
-            love.graphics.setColor(1, 1, 1, 1)
-            for _, seg in ipairs(parse_ansi(msg)) do
-                love.graphics.setColor(seg.color)
-                safe_print(seg.text, x, y)
-                x = x + font:getWidth(seg.text)
+        -- Draw terminal content for each window
+        local contentX = window.x + 16
+        local contentY = window.y + window.barHeight + 8
+        -- Calculate available width for input
+        local availableWidth = window.width - 32
+        local inputText = (inputBuffers[window.id] or "") .. (cursorVisible and "_" or " ")
+        local wrappedText, wrappedLines = font:getWrap(inputText, availableWidth)
+        local inputHeight = #wrappedLines * fontHeight
+        -- Position input at the bottom of the window
+        local inputY = window.y + window.height - inputHeight - 16
+        safe_printf(inputText, contentX, inputY, availableWidth, "left")
+        -- Calculate the area above the input for status and messages
+        local belowInputY = inputY
+        -- Draw messages with ANSI color parsing
+        local y = window.y + window.barHeight + 8
+        local maxLinesInWin = math.floor((belowInputY - y - 24) / fontHeight)
+        local startIdx = math.max(1, #(messages[window.id] or {}) - maxLinesInWin - (scrollOffsets[window.id] or 0) + 1)
+        local endIdx = math.max(1, #(messages[window.id] or {}) - (scrollOffsets[window.id] or 0))
+        for i = startIdx, endIdx do
+            local msg = messages[window.id] and messages[window.id][i]
+            if msg then
+                local x = contentX
+                local segments = parse_ansi(msg)
+                for _, segment in ipairs(segments) do
+                    love.graphics.setColor(segment.color)
+                    love.graphics.print(segment.text, x, y)
+                    x = x + font:getWidth(segment.text)
+                end
+                y = y + fontHeight
             end
-            y = y + fontHeight
         end
     end
-    love.graphics.setColor(1,1,1,1)
 end
 
 -- Clean up when the game closes

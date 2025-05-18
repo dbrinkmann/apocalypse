@@ -1,4 +1,5 @@
 -- game_world.lua
+local Logger = require("logger")
 local GameWorld = {
     background = nil,
     entities = {},
@@ -66,10 +67,41 @@ function Item:draw()
     love.graphics.draw(self.sprite, self.x, self.y)
 end
 
+-- Function to load room background
+function GameWorld:loadRoomBackground(roomName)
+    if not roomName then return end
+    
+    -- Clean the room name for filename use
+    local cleanName = roomName:gsub("[^%w%s]", ""):gsub("%s+", "_")
+    
+    -- Try both .jpg and .png extensions
+    local extensions = {".jpg", ".png"}
+    local success = false
+    local image = nil
+    
+    for _, ext in ipairs(extensions) do
+        local imagePath = "images/rooms/" .. cleanName .. ext
+        success, image = pcall(function() return love.graphics.newImage(imagePath) end)
+        if success and image then
+            self.background = image
+            return
+        end
+    end
+    
+    -- Fallback to default city image
+    local defaultPath = "images/rooms/City of Midgaard.png"
+    success, image = pcall(function() return love.graphics.newImage(defaultPath) end)
+    if success and image then
+        self.background = image
+    else
+        self.background = nil
+    end
+end
+
 -- GameWorld methods
 function GameWorld:load()
-    -- Load background
-    self.background = love.graphics.newImage("images/rooms/The Temple of Midgaard.jpg")
+    -- Load initial background
+    self:loadRoomBackground("The Temple of Midgaard")
     
     -- Load entity sprites
     -- local npcSprite = love.graphics.newImage("images/npc.png")
@@ -92,7 +124,8 @@ function GameWorld:update(dt)
     end
 end
 
-function GameWorld:draw()
+function GameWorld:draw(roomName, roomNameFont, font)
+    --Logger.debug("Room name: " .. tostring(roomName) .. " " .. tostring(roomNameFont) .. " " .. tostring(font))
     -- Draw background
     if self.background then
         local winW, winH = love.graphics.getWidth(), love.graphics.getHeight()
@@ -103,12 +136,20 @@ function GameWorld:draw()
         love.graphics.setColor(1,1,1,1)
         love.graphics.draw(self.background, offsetX, 0, 0, scale, scale)
     end
-    
+    -- Draw room name (if provided)
+    if roomName and roomNameFont then
+        love.graphics.setFont(roomNameFont)
+        love.graphics.setColor(1, 1, 1, 0.9)
+        local textWidth = roomNameFont:getWidth(roomName)
+        local textX = (love.graphics.getWidth() - textWidth) / 2
+        local textY = 32
+        love.graphics.print(roomName, textX, textY)
+        love.graphics.setFont(font)
+    end
     -- Draw items
     for _, item in ipairs(self.items) do
         item:draw()
     end
-    
     -- Draw entities
     for _, entity in ipairs(self.entities) do
         entity:draw()
