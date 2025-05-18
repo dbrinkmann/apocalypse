@@ -3,19 +3,25 @@ local socket = require("socket")
 local GameWorld = require("game_world")
 local Parser = require("parser")
 local Logger = require("logger")
+local StatusBar = require("components/status_bar")
 
--- Login states
-local LOGIN_STATE = {
-    INITIAL = 0,
-    SENT_NAME = 1,
-    SENT_PASSWORD = 2,
-    SENT_EMPTY = 3,
-    WAITING_RECONNECT = 4,
-    SENT_RECONNECT = 5,
-    WAITING_WELCOME = 6,
-    SENT_MENU_CHOICE = 7,
-    COMPLETE = 8
+require("states.main")
+require("helpers")
+
+require("utils.extensions")
+
+local stateIndex = {
 }
+for _, state in pairs(CharacterStates) do
+    stateIndex[state.name] = state
+end
+
+local connectionStates = {
+    --[1] = {
+    --    state = {},
+    --    lastRefreshCharacterStateTime = 0
+    --},
+} 
 
 -- Game window config
 local gameWin = {
@@ -33,12 +39,13 @@ local gameWin = {
 local uiWindows = {}
 local activeWindow = nil
 local windowZOrder = {}
+local statusBars = {} -- Store status bars for each connection
+local statusBarPositions = {} -- Store positions for each status bar
 
 -- Each connection represents one MUD session
 local connections = {}
 local inputBuffers = {}  -- Changed to table to store input buffer per connection
 local messages = {}  -- Changed to table to store messages per connection
-local loginStates = {}  -- Track login state for each connection
 local loginConfig = {}  -- Store login credentials from config
 local font, fontHeight
 local roomNameFont = nil  -- New font for room name
@@ -284,52 +291,76 @@ local function loadLoginConfig()
     file:close()
 end
 
+-- Function to save window positions and sizes to config
+local function saveWindowConfig()
+    -- First read existing config to preserve non-window settings
+    local existingConfig = {}
+    local file = io.open("config.txt", "r")
+    if file then
+        for line in file:lines() do
+            local key, value = line:match("([^=]+)=(.+)")
+            if key and value and not key:match("^window%d+_") then
+                existingConfig[key] = value
+            end
+        end
+        file:close()
+    end
+    
+    -- Now write everything back
+    file = io.open("config.txt", "w")
+    if not file then
+        Logger.debug("Failed to open config.txt for writing")
+        return
+    end
+    
+    -- Write existing non-window config first
+    for key, value in pairs(existingConfig) do
+        file:write(string.format("%s=%s\n", key, value))
+    end
+    
+    -- Write window positions and sizes
+    for _, window in ipairs(uiWindows) do
+        file:write(string.format("window%d_x=%d\n", window.id, window.x))
+        file:write(string.format("window%d_y=%d\n", window.id, window.y))
+        file:write(string.format("window%d_width=%d\n", window.id, window.width))
+        file:write(string.format("window%d_height=%d\n", window.id, window.height))
+    end
+    
+    file:close()
+end
+
+-- Function to get window position and size from config
+local function getWindowConfig(id)
+    return {
+        x = tonumber(loginConfig["window" .. id .. "_x"]) or 50,
+        y = tonumber(loginConfig["window" .. id .. "_y"]) or 50,
+        width = tonumber(loginConfig["window" .. id .. "_width"]) or 900,
+        height = tonumber(loginConfig["window" .. id .. "_height"]) or 600
+    }
+end
+
 -- Initialize connection-specific data
 local function initConnectionData(connId)
     inputBuffers[connId] = ""
     messages[connId] = {}
     scrollOffsets[connId] = 0
-    loginStates[connId] = LOGIN_STATE.INITIAL
-end
-
--- Function to handle login process
-local function handleLogin(conn, msg)
-    if loginStates[conn.id] == LOGIN_STATE.INITIAL then
-        -- Send character name
-        table.insert(conn.outgoing, loginConfig["conn" .. conn.id .. "_character"])
-        loginStates[conn.id] = LOGIN_STATE.SENT_NAME
-        --Logger.debug("[LOGIN]["..conn.id.."] SENDING NAME")
-    elseif loginStates[conn.id] == LOGIN_STATE.SENT_NAME then
-        -- Send password
-        table.insert(conn.outgoing, loginConfig["conn" .. conn.id .. "_password"])
-        loginStates[conn.id] = LOGIN_STATE.SENT_PASSWORD
-        --Logger.debug("[LOGIN]["..conn.id.."] SENDING PASSWORD")
-    elseif loginStates[conn.id] == LOGIN_STATE.SENT_PASSWORD then
-        -- Send empty line
-        table.insert(conn.outgoing, "")
-        loginStates[conn.id] = LOGIN_STATE.SENT_EMPTY
-        --Logger.debug("[LOGIN]["..conn.id.."] SENDING EMPTY LINE")
-    elseif loginStates[conn.id] == LOGIN_STATE.SENT_EMPTY then
-        if msg:match("Reconnecting.") or msg:match("You take over your own body, already in use!") then
-            loginStates[conn.id] = LOGIN_STATE.WAITING_RECONNECT
-        elseif msg:match("Welcome to Apocalypse VI!") then
-            table.insert(conn.outgoing, "")
-            loginStates[conn.id] = LOGIN_STATE.WAITING_WELCOME
-        end
-    elseif loginStates[conn.id] == LOGIN_STATE.WAITING_RECONNECT then
-        -- Send 'l' for reconnect
-        table.insert(conn.outgoing, "l")
-        loginStates[conn.id] = LOGIN_STATE.COMPLETE
-    elseif loginStates[conn.id] == LOGIN_STATE.WAITING_WELCOME then
-        -- Send menu choice '1'
-        --Logger.debug("[LOGIN]["..conn.id.."] SENDING MENU CHOICE 1")
-        table.insert(conn.outgoing, "1")
-        loginStates[conn.id] = LOGIN_STATE.SENT_MENU_CHOICE
-    elseif loginStates[conn.id] == LOGIN_STATE.SENT_MENU_CHOICE then
-        -- Login complete
-        --Logger.debug("[LOGIN]["..conn.id.."] LOGIN COMPLETE")
-        loginStates[conn.id] = LOGIN_STATE.COMPLETE
-    end
+    connectionStates[connId] = {
+        state = deepcopy(stateIndex["Login"]),
+        localView = {
+            currentRoom = "Unknown Room",            
+            characterStats = {
+                hp = { current = 0, max = 0 },
+                mana = { current = 0, max = 0 },
+                vitality = { current = 0, max = 0 },
+                xp = { current = 0, max = 0 },
+                sp = { current = 0, max = 0 }
+            }
+        },
+        lastRefreshCharacterStateTime = 0,
+        character = loginConfig["conn" .. connId .. "_character"],
+        password = loginConfig["conn" .. connId .. "_password"]
+    }
+    connectionStates[connId].state.init(conn, connectionStates[connId])
 end
 
 -- Create a coroutine for each connection
@@ -381,11 +412,6 @@ local function createConnection(host, port, connId)
             while true do
                 local line, err, partial = conn.tcp:receive("*l")
                 if line then
-                    -- Handle login process
-                    if loginStates[conn.id] < LOGIN_STATE.COMPLETE then
-                        --Logger.debug("[LOGIN]["..conn.id.."] HANDLING LOGIN")
-                        handleLogin(conn, line)
-                    end
                     -- Sanitize the received line before storing it
                     local sanitized = sanitize_utf8(line)
                     table.insert(conn.incoming, sanitized)
@@ -444,34 +470,55 @@ function love.load()
     local conn1 = createConnection("apocalypse6.com", 6000, 1)
     table.insert(connections, conn1)
     
+    -- Get window config for first terminal
+    local win1Config = getWindowConfig(1)
+    
     -- Create terminal window for connection 1
     local termWin1 = UIWindow:new({
-        title = "Terminal 1",
-        x = 50,
-        y = 50,
+        title = loginConfig["conn1_character"] or "Terminal 1",
+        x = win1Config.x,
+        y = win1Config.y,
+        width = win1Config.width,
+        height = win1Config.height,
         id = 1
     })
     table.insert(uiWindows, termWin1)
+    
+    -- Create status bar for connection 1
+    statusBars[1] = StatusBar:new()
+    statusBarPositions[1] = {
+        x = 50,
+        y = 50
+    }
     
     -- Only create second terminal if config exists
     if loginConfig["conn2_character"] and loginConfig["conn2_password"] then
         local conn2 = createConnection("apocalypse6.com", 6000, 2)
         table.insert(connections, conn2)
         
+        -- Get window config for second terminal
+        local win2Config = getWindowConfig(2)
+        
         local termWin2 = UIWindow:new({
-            title = "Terminal 2",
-            x = 500,
-            y = 50,
+            title = loginConfig["conn2_character"] or "Terminal 2",
+            x = win2Config.x,
+            y = win2Config.y,
+            width = win2Config.width,
+            height = win2Config.height,
             id = 2
         })
         table.insert(uiWindows, termWin2)
+        
+        -- Create status bar for connection 2
+        statusBars[2] = StatusBar:new()
+        statusBarPositions[2] = {
+            x = 50,
+            y = 200
+        }
     end
     
     -- Set initial active window
     activeWindow = termWin1
-    
-    -- Center terminal windows
-    centerWindow()
 end
 
 function love.update(dt)
@@ -482,7 +529,7 @@ function love.update(dt)
     end
     
     -- Update game world
-    GameWorld:update(dt)
+    GameWorld:update(dt)    
     
     -- Update connections
     for _, conn in ipairs(connections) do
@@ -534,22 +581,29 @@ function love.update(dt)
         if conn.coroutine and coroutine.status(conn.coroutine) ~= "dead" then
             coroutine.resume(conn.coroutine)
         end
+
+        for _, msg in ipairs(conn.incoming) do
+            Logger.raw(msg)
+        end
         
-        -- Move incoming to global messages list
+        --Logger.debug("INCOMING "..tostring(conn.incoming))
+        local newState = connectionStates[conn.id].state:update(conn, connectionStates[conn.id], conn.incoming)
+        if newState then
+            connectionStates[conn.id].state = deepcopy(stateIndex[newState])
+            connectionStates[conn.id].state.init(conn, connectionStates[conn.id])
+        end
+
+        -- Process incoming messages
         for _, msg in ipairs(conn.incoming) do
             if type(msg) ~= "string" then
                 msg = "[Non-string data]"
             end
             -- Parse the message before adding it to the display
-            if Parser:parse(msg) then
-                -- If we parsed a new room name, update the background
-                GameWorld:loadRoomBackground(Parser:getCurrentRoom())
-                if Parser:getCurrentRoom() then
-                    gameWorld.currentRoom = { name = Parser:getCurrentRoom() }
-                end
-            end
-            table.insert(messages[conn.id], msg)
-            Logger.raw(msg)
+            local shouldDisplay = Parser:parse(msg, conn.id, connectionStates[conn.id])            
+
+            if shouldDisplay then
+                table.insert(messages[conn.id], msg)
+            end            
         end
         conn.incoming = {}
     end
@@ -564,9 +618,9 @@ function love.update(dt)
     end
     for _, window in ipairs(uiWindows) do
         if disconnected then
-            window.title = "Terminal " .. window.id .. " [DISCONNECTED]"
+            window.title = (loginConfig["conn" .. window.id .. "_character"] or "Terminal " .. window.id) .. " [DISCONNECTED]"
         else
-            window.title = "Terminal " .. window.id
+            window.title = loginConfig["conn" .. window.id .. "_character"] or "Terminal " .. window.id
         end
     end
 end
@@ -581,7 +635,44 @@ function love.keypressed(key)
         return
     end
     
-    if key == "return" then
+    -- Movement controls
+    if key == "kp8" then  -- North
+        for _, conn in ipairs(connections) do
+            if conn.id == activeWindow.id and conn.status == "connected" then
+                table.insert(conn.outgoing, "n")
+            end
+        end
+    elseif key == "kp2" then  -- South
+        for _, conn in ipairs(connections) do
+            if conn.id == activeWindow.id and conn.status == "connected" then
+                table.insert(conn.outgoing, "s")
+            end
+        end
+    elseif key == "kp6" then  -- East
+        for _, conn in ipairs(connections) do
+            if conn.id == activeWindow.id and conn.status == "connected" then
+                table.insert(conn.outgoing, "e")
+            end
+        end
+    elseif key == "kp4" then  -- West
+        for _, conn in ipairs(connections) do
+            if conn.id == activeWindow.id and conn.status == "connected" then
+                table.insert(conn.outgoing, "w")
+            end
+        end
+    elseif key == "kp+" then  -- Up
+        for _, conn in ipairs(connections) do
+            if conn.id == activeWindow.id and conn.status == "connected" then
+                table.insert(conn.outgoing, "up")
+            end
+        end
+    elseif key == "kp-" then  -- Down
+        for _, conn in ipairs(connections) do
+            if conn.id == activeWindow.id and conn.status == "connected" then
+                table.insert(conn.outgoing, "down")
+            end
+        end
+    elseif key == "return" then
         if inputBuffers[activeWindow.id] ~= "" then
             for _, conn in ipairs(connections) do
                 if conn.id == activeWindow.id and conn.status == "connected" then
@@ -667,6 +758,18 @@ function love.mousepressed(x, y, button)
                 break
             end
         end
+        
+        -- Check if any status bar was clicked
+        for _, statusBar in pairs(statusBars) do
+            if statusBar:isPointInside(x, y) then
+                if statusBar:isTitleBar(x, y) then
+                    statusBar.dragging = true
+                    statusBar.dragOffsetX = x - statusBar.x
+                    statusBar.dragOffsetY = y - statusBar.y
+                end
+                break
+            end
+        end
     end
 end
 
@@ -680,13 +783,30 @@ function love.mousemoved(x, y, dx, dy)
             window.height = math.max(window.minHeight, y - window.y + window.resizeOffsetY)
         end
     end
+    
+    -- Handle status bar dragging
+    for id, statusBar in pairs(statusBars) do
+        if statusBar.dragging and statusBarPositions[id] then
+            statusBarPositions[id].x = x - statusBar.dragOffsetX
+            statusBarPositions[id].y = y - statusBar.dragOffsetY
+        end
+    end
 end
 
 function love.mousereleased(x, y, button)
     if button == 1 then  -- Left mouse button
         for _, window in ipairs(uiWindows) do
+            if window.dragging or window.resizing then
+                -- Save window positions when they change
+                saveWindowConfig()
+            end
             window.dragging = false
             window.resizing = false
+        end
+        
+        -- Handle status bar release
+        for _, statusBar in pairs(statusBars) do
+            statusBar.dragging = false
         end
     end
 end
@@ -694,7 +814,6 @@ end
 function love.resize(w, h)
     gameWin.width = w
     gameWin.height = h
-    centerWindow()
 end
 
 -- Defensive print function
@@ -719,12 +838,12 @@ function love.draw()
     end
     
     -- Draw game world (background, room name, items, entities)
-    local roomName = (gameWorld.currentRoom and gameWorld.currentRoom.name) or "Unknown Room"
-    GameWorld:draw(roomName, roomNameFont, font)
+    GameWorld:draw(connectionStates[1].localView, roomNameFont, font)
     
     -- Draw all UI windows on top of the game world and room name
     for _, window in ipairs(uiWindows) do
         window:draw()
+        
         -- Draw terminal content for each window
         local contentX = window.x + 16
         local contentY = window.y + window.barHeight + 8
@@ -757,11 +876,22 @@ function love.draw()
             end
         end
     end
+    
+    -- Draw status bars independently
+    for id, statusBar in pairs(statusBars) do
+        if statusBarPositions[id] then
+            local stats = connectionStates[id].localView.characterStats
+            stats.character = loginConfig["conn" .. id .. "_character"]
+            statusBar:draw(statusBarPositions[id].x, statusBarPositions[id].y, stats)
+        end
+    end
 end
 
 -- Clean up when the game closes
 function love.quit()
     Logger.close()
+    -- Save window positions before closing
+    saveWindowConfig()
     -- Close all connections
     for _, conn in ipairs(connections) do
         if conn.tcp then
