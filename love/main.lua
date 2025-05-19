@@ -586,14 +586,34 @@ function love.update(dt)
             Logger.raw(msg)
         end
         
-        --Logger.debug("INCOMING "..tostring(conn.incoming))
-        local newState = connectionStates[conn.id].state:update(conn, connectionStates[conn.id], conn.incoming)
-        if newState then
-            connectionStates[conn.id].state = deepcopy(stateIndex[newState])
-            connectionStates[conn.id].state.init(conn, connectionStates[conn.id])
+        -- Process incoming messages one at a time
+        local messagesToRemove = {}
+        for i, msg in ipairs(conn.incoming) do
+            local result = connectionStates[conn.id].state:update(conn, connectionStates[conn.id], msg)
+            if result.newState then
+                connectionStates[conn.id].state = deepcopy(stateIndex[result.newState])
+                connectionStates[conn.id].state.init(conn, connectionStates[conn.id])
+            end
+
+            if result.removeMessage then
+                table.insert(messagesToRemove, i)
+            end
         end
 
-        -- Process incoming messages
+        -- If there are no incoming messages, update the state
+        if #conn.incoming == 0 then
+            local result = connectionStates[conn.id].state:update(conn, connectionStates[conn.id], nil)
+            if result.newState then
+                connectionStates[conn.id].state = deepcopy(stateIndex[result.newState])
+                connectionStates[conn.id].state.init(conn, connectionStates[conn.id])
+            end
+        end
+
+        -- iterate backwards through the messages to remove
+        for i = #messagesToRemove, 1, -1 do
+            table.remove(conn.incoming, messagesToRemove[i])
+        end
+
         for _, msg in ipairs(conn.incoming) do
             if type(msg) ~= "string" then
                 msg = "[Non-string data]"

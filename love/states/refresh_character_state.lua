@@ -216,29 +216,27 @@ CharacterStates.RefreshCharacterState = {
         self.currentLine = 1
     end,
 
-    update = function(self, conn, connectionStateTable, messages)
+    -- Returns table with new states or nil if no new state and a boolean if we should remove the message for display
+    update = function(self, conn, connectionStateTable, message)
         if self.step == REFRESH_CHARACTER_STATE.START then
             table.insert(conn.outgoing, "att")
             self.step = REFRESH_CHARACTER_STATE.READING
             Logger.debug("[REFRESH_CHARACTER_STATE]["..conn.id.."] SENDING ATT")
         elseif self.step == REFRESH_CHARACTER_STATE.READING then
-            for lineIndex, msg in ipairs(messages) do
-                local clean_msg = strip_ansi(msg)
+            if message then
+                local clean_msg = strip_ansi(message)
                 --Logger.debug("[Parser] Clean message: " .. clean_msg)
                 
                 if clean_msg:match("=================================%[Condition%]=================================") then
                     self.step = REFRESH_CHARACTER_STATE.PROCESSING
-                    self.startIndex = lineIndex
+                    self.currentLine = self.currentLine + 1
                     --Logger.debug("[REFRESH_CHARACTER_STATE]["..conn.id.."] FOUND CONDITION HEADER")
-                    break
+                    return {newState = nil, removeMessage = true}
                 end
             end
-        end
-        
-        if self.step == REFRESH_CHARACTER_STATE.PROCESSING then
-            local messagesToRemove = {}
-            for i, msg in ipairs(messages) do
-                local clean_msg = strip_ansi(msg)
+        elseif self.step == REFRESH_CHARACTER_STATE.PROCESSING then
+            if message then
+                local clean_msg = strip_ansi(message)
                 --Logger.debug("[Parser] Clean message: " .. clean_msg)
                 
                 -- Get the pattern for current line
@@ -250,29 +248,22 @@ CharacterStates.RefreshCharacterState = {
                         -- Call the processing function with all matches
                         linePattern.process(conn, connectionStateTable, unpack(matches))
                         self.currentLine = self.currentLine + 1
-                        table.insert(messagesToRemove, i)
                         
                         -- If we've processed all lines, move to complete state
                         if self.currentLine > #ATT_LINE_PATTERNS then
                             self.step = REFRESH_CHARACTER_STATE.COMPLETE
                             Logger.debug("[REFRESH_CHARACTER_STATE]["..conn.id.."] COMPLETE")
-                            -- Remove all processed messages
-                            for j = #messagesToRemove, 1, -1 do
-                                --Logger.debug("[REFRESH_CHARACTER_STATE]["..conn.id.."] REMOVING MESSAGE "..messagesToRemove[j])
-                                table.remove(messages, messagesToRemove[j])
-                            end
-                            return "Idle"
+                            return {newState = "Idle", removeMessage = true}
                         end
+
+                        return {newState = nil, removeMessage = true}
                     else
                         Logger.debug("[ERROR][REFRESH_CHARACTER_STATE]["..conn.id.."] NO MATCH "..linePattern.pattern)
                     end
                 end
             end
-            
-            -- Remove processed messages
-            for i = #messagesToRemove, 1, -1 do
-                table.remove(messages, messagesToRemove[i])
-            end
         end
+        
+        return {newState = nil, removeMessage = false}
     end
 }
